@@ -1,7 +1,8 @@
 import streamlit as st
 import asyncio
-import os
 import json
+import urllib.request
+import urllib.error
 import pandas as pd
 from dotenv import load_dotenv
 from lifecareagent import Life_Care_Agent, Runner
@@ -12,6 +13,10 @@ load_dotenv()
 # Initialize session state
 if 'research_data' not in st.session_state:
     st.session_state.research_data = None
+if 'location_input' not in st.session_state:
+    st.session_state.location_input = ""
+if 'pending_location_value' not in st.session_state:
+    st.session_state.pending_location_value = None
 
 def main():
     # Header - Simple title and description
@@ -26,13 +31,50 @@ def main():
         help="Enter one item per line or separate with commas"
     )
 
+    # If there is a staged detected location, apply it BEFORE rendering the input
+    if st.session_state.pending_location_value is not None:
+        st.session_state.location_input = st.session_state.pending_location_value
+        st.session_state.pending_location_value = None
+
+    # Location input and detection button
+    st.markdown("#### Location")
+    loc_col1, loc_col2 = st.columns([3, 1])
+    with loc_col1:
+        st.text_input(
+            "Patient location (city, state or ZIP)",
+            key="location_input",
+            placeholder="e.g., Austin, TX or 78701"
+        )
+    with loc_col2:
+        if st.button("Use My Current Location"):
+            try:
+                # Use a short timeout to avoid freezing the UI on slow networks
+                with urllib.request.urlopen("https://ipapi.co/json/", timeout=4) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                city = (data.get("city") or "").strip()
+                region = (data.get("region") or data.get("region_code") or "").strip()
+                postal = (data.get("postal") or "").strip()
+                country = (data.get("country_name") or data.get("country") or "").strip()
+
+                # Prefer City, Region; fall back to ZIP; then Country
+                detected = ", ".join([p for p in [city, region] if p]) or postal or country
+                if detected:
+                    st.session_state.pending_location_value = detected
+                    st.success(f"Detected location: {detected}")
+                    st.rerun()
+                else:
+                    st.info("Could not detect a precise location. Please enter it manually.")
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
+                st.warning("Location detection failed. Please enter your location manually.")
+
     # Research button - Large and prominent
     if st.button("Start Research", type="primary", use_container_width=True):
         if items_input.strip():
             # Show progress while researching
             with st.spinner("AI is researching your items... Please wait."):
                 try:
-                    result = asyncio.run(research_items(items_input))
+                    user_location = (st.session_state.get("location_input") or "").strip()
+                    result = asyncio.run(research_items(items_input, user_location))
                     # Try to parse JSON
                     research_data = json.loads(result)
                     st.session_state.research_data = research_data
@@ -71,17 +113,22 @@ def render_doctor_review():
     # Convert to DataFrame for editing
     df_data = []
     for item in items:
+        sources = item.get('sources', [])
+        # Display plain URLs on separate lines, no brackets or parentheses
+        source_links = '\n'.join([str(s) for s in sources])
         df_data.append({
             'Item/Service': item.get('item_service', ''),
             'Cost ($)': item.get('cost_per_unit', 0.0),
             'Frequency': item.get('frequency', ''),
             'CPT Code': item.get('cpt_code', ''),
             'Comment': item.get('comment', ''),
+            'Sources': source_links,
             'Doctor Approval': 'Pending',
             'Doctor Notes': ''
         })
 
     df = pd.DataFrame(df_data)
+
 
     # Display item count
     st.write(f"**{len(items)} items found for review**")
@@ -118,61 +165,18 @@ def render_doctor_review():
     col2.metric("❌ Rejected", rejected_count)
     col3.metric("⏳ Pending", pending_count)
 
-    # Export button
-    if st.button("📄 Export Report", type="primary", use_container_width=True):
-        export_text = generate_report(edited_df)
-        st.download_button(
-            "📥 Download Life Care Report",
-            export_text,
-            file_name=f"life_care_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.txt",
-            mime="text/plain"
-        )
+    # Export removed
 
-def generate_report(df):
-    """Generate a formatted report from the reviewed data"""
-    report = "LIFE CARE PLANNING REPORT\n"
-    report += "=" * 50 + "\n\n"
-    report += f"Generated: {pd.Timestamp.now().strftime('%B %d, %Y at %I:%M %p')}\n\n"
-
-    # Summary
-    approved_count = len(df[df['Doctor Approval'] == 'Approved'])
-    total_approved_cost = df[df['Doctor Approval'] == 'Approved']['Cost ($)'].sum()
-
-    report += "SUMMARY\n"
-    report += "-" * 20 + "\n"
-    report += f"Total Items Reviewed: {len(df)}\n"
-    report += f"Items Approved: {approved_count}\n"
-    report += f"Total Approved Annual Cost: ${total_approved_cost:,.2f}\n\n"
-
-    # Approved items
-    approved_items = df[df['Doctor Approval'] == 'Approved']
-    if len(approved_items) > 0:
-        report += "APPROVED ITEMS\n"
-        report += "-" * 20 + "\n"
-        for _, row in approved_items.iterrows():
-            report += f"Item: {row['Item/Service']}\n"
-            report += f"Cost: ${row['Cost ($)']:,.2f}\n"
-            report += f"Frequency: {row['Frequency']}\n"
-            if row['CPT Code']:
-                report += f"CPT Code: {row['CPT Code']}\n"
-            if row['Doctor Notes']:
-                report += f"Doctor Notes: {row['Doctor Notes']}\n"
-            report += "\n"
-
-    # Rejected items
-    rejected_items = df[df['Doctor Approval'] == 'Rejected']
-    if len(rejected_items) > 0:
-        report += "REJECTED ITEMS\n"
-        report += "-" * 20 + "\n"
-        for _, row in rejected_items.iterrows():
-            report += f"Item: {row['Item/Service']}\n"
-            report += f"Reason: {row['Doctor Notes'] if row['Doctor Notes'] else 'No reason provided'}\n\n"
-
-    return report
-
-async def research_items(items_text):
+async def research_items(items_text, location):
     """Send the user's list directly to the agent"""
-    prompt = f"Research the following medical items and provide costs, codes, and details: {items_text}"
+    location_clause = (
+        f" The patient's location is: {location}. Prioritize pricing, availability, and codes relevant to this location when possible."
+        if location else ""
+    )
+    prompt = (
+        "Research the following medical items and provide costs, codes, and details: "
+        f"{items_text}." + location_clause
+    )
     result = await Runner.run(Life_Care_Agent, prompt)
     return result.final_output
 
